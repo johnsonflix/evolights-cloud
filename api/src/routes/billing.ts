@@ -1,0 +1,99 @@
+import type { FastifyInstance } from 'fastify';
+import type Stripe from 'stripe';
+
+export async function registerBillingRoutes(app: FastifyInstance) {
+  const priceId = process.env.STRIPE_PRICE_ID_MONTHLY;
+
+  // Helper: get-or-create the Stripe customer for a user, persisted in subscriptions table.
+  async function ensureCustomer(userId: string, email: string): Promise<string> {
+    const r = await app.db.query('select stripe_customer_id from subscriptions where user_id=$1', [userId]);
+    if (r.rowCount && r.rows[0].stripe_customer_id) return r.rows[0].stripe_customer_id;
+
+    const customer = await app.stripe.customers.create({ email, metadata: { user_id: userId } });
+    await app.db.query(
+      `insert into subscriptions (user_id, stripe_customer_id, status)
+       values ($1, $2, 'incomplete')
+       on conflict (user_id) do update set stripe_customer_id = excluded.stripe_customer_id`,
+      [userId, customer.id],
+    );
+    return customer.id;
+  }
+
+  // POST /v1/billing/checkout — returns a Stripe Checkout Session URL for the user to subscribe.
+  app.post('/v1/billing/checkout', { preHandler: app.requireUser }, async (req: any, reply) => {
+    if (!app.stripe) return reply.code(503).send({ error: 'billing_disabled' });
+    if (!priceId) return reply.code(500).send({ error: 'STRIPE_PRICE_ID_MONTHLY not configured' });
+
+    const customerId = await ensureCustomer(req.user.sub, req.user.email);
+    const session = await app.stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: customerId,
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: process.env.BILLING_SUCCESS_URL ?? 'evolights://billing/success?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url:  process.env.BILLING_CANCEL_URL  ?? 'evolights://billing/cancel',
+      allow_promotion_codes: true,
+      client_reference_id: req.user.sub,
+    });
+    return reply.send({ url: session.url });
+  });
+
+  // POST /v1/billing/portal — Stripe Customer Portal for managing/cancelling subscription
+  app.post('/v1/billing/portal', { preHandler: app.requireUser }, async (req: any, reply) => {
+    if (!app.stripe) return reply.code(503).send({ error: 'billing_disabled' });
+    const customerId = await ensureCustomer(req.user.sub, req.user.email);
+    const session = await app.stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: process.env.BILLING_PORTAL_RETURN_URL ?? 'evolights://billing/return',
+    });
+    return reply.send({ url: session.url });
+  });
+
+  // POST /v1/billing/webhook — Stripe -> us. Validates signature, updates subscription state.
+  // Note: registers a custom raw body parser scoped to this route only; everything else
+  // continues to use Fastify's default JSON parser.
+  app.post('/v1/billing/webhook', {
+    config: { rawBody: true },
+    preParsing: async (req, _reply, payload) => payload,   // keep raw stream
+  } as any, async (req: any, reply) => {
+    if (!app.stripe) return reply.code(503).send({ error: 'billing_disabled' });
+    const signature = req.headers['stripe-signature'];
+    const secret = process.env.STRIPE_WEBHOOK_SECRET;
+    if (!signature || !secret) return reply.code(400).send({ error: 'missing_signature_or_secret' });
+
+    let event: Stripe.Event;
+    try {
+      event = app.stripe.webhooks.constructEvent(req.rawBody ?? req.body, signature, secret);
+    } catch (e: any) {
+      app.log.warn({ err: e.message }, 'stripe webhook signature failed');
+      return reply.code(400).send({ error: 'bad_signature' });
+    }
+
+    const upsert = async (sub: Stripe.Subscription) => {
+      const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer.id;
+      const periodEnd  = sub.items.data[0]?.current_period_end ?? null;
+      await app.db.query(
+        `update subscriptions
+            set stripe_sub_id = $1,
+                status = $2,
+                current_period_end = to_timestamp($3),
+                updated_at = now()
+          where stripe_customer_id = $4`,
+        [sub.id, sub.status, periodEnd, customerId],
+      );
+    };
+
+    switch (event.type) {
+      case 'customer.subscription.created':
+      case 'customer.subscription.updated':
+      case 'customer.subscription.deleted':
+      case 'customer.subscription.trial_will_end':
+        await upsert(event.data.object as Stripe.Subscription);
+        break;
+      case 'checkout.session.completed': {
+        // Subscription is created in the same event family above; nothing extra here.
+        break;
+      }
+    }
+    return reply.send({ received: true });
+  });
+}
