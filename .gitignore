@@ -1,0 +1,21 @@
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+build/
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Mosquitto runtime
+mosquitto/data/
+mosquitto/log/
+
+# TLS material
+*.pem
+*.key
+!api/test/fixtures/*.pem
+secrets/

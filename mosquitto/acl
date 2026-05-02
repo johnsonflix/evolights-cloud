@@ -1,0 +1,19 @@
+# Mosquitto ACL — least-privilege topic access.
+#
+# Topic scheme:
+#   evolights/<device_id>/cmd     api → device   (commands)
+#   evolights/<device_id>/state   device → api   (status, telemetry)
+#   evolights/<device_id>/ota     api → device   (signed OTA manifest)
+#   evolights/<device_id>/log     device → api   (debug logs, opt-in)
+
+# The api service has full read/write across the namespace.
+user api
+topic readwrite evolights/#
+
+# Per-device users are appended below by the pairing service.
+# Pattern (substituted at write time):
+#   user dev_<device_id>
+#   topic write evolights/<device_id>/state
+#   topic write evolights/<device_id>/log
+#   topic read  evolights/<device_id>/cmd
+#   topic read  evolights/<device_id>/ota
