@@ -363,4 +363,125 @@ export async function registerAdminRoutes(app: FastifyInstance) {
       return reply.send({ coupon });
     } catch (e: any) { return stripeError(reply, app.log, e); }
   });
+
+  // =========================== Cross-tenant device list ==================
+  // GET /v1/admin/devices?q=&limit=&offset=
+  //
+  // The per-user GET /v1/devices is scoped to the caller's user_id; admins
+  // need the full fleet view (e.g. to investigate a paired device that the
+  // owner can't reach, or to spot rogue rows). `q` is a substring match on
+  // device name, hardware_id, or owner email — bound parameters; no
+  // injection risk. Same admin gate as everything else here.
+  app.get('/v1/admin/devices', adminGuard, async (req, reply) => {
+    const schema = z.object({
+      q:      z.string().max(255).optional(),
+      limit:  z.coerce.number().int().min(1).max(200).default(50),
+      offset: z.coerce.number().int().min(0).default(0),
+    });
+    const parsed = schema.safeParse(req.query);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_payload' });
+
+    const params: any[] = [];
+    let where = '';
+    if (parsed.data.q) {
+      params.push(`%${parsed.data.q}%`);
+      where = `where d.name ilike $${params.length}
+                  or d.hardware_id ilike $${params.length}
+                  or u.email ilike $${params.length}`;
+    }
+    params.push(parsed.data.limit, parsed.data.offset);
+    const rows = await app.db.query(
+      `select d.id, d.name, d.hardware_id, d.firmware_version,
+              d.last_seen_at, d.created_at,
+              d.user_id, u.email as user_email
+         from devices d
+         join users u on u.id = d.user_id
+        ${where}
+        order by d.created_at desc
+        limit $${params.length - 1} offset $${params.length}`,
+      params,
+    );
+    const total = await app.db.query<{ c: string }>(
+      `select count(*)::text c
+         from devices d
+         join users u on u.id = d.user_id
+        ${where}`,
+      parsed.data.q ? [params[0]] : [],
+    );
+    return reply.send({
+      devices: rows.rows,
+      total:   Number(total.rows[0].c),
+      limit:   parsed.data.limit,
+      offset:  parsed.data.offset,
+    });
+  });
+
+  // =========================== Firmware list =============================
+  // GET /v1/admin/firmware
+  //
+  // List published firmware manifest rows so the admin UI can show what's
+  // currently shipping. Returned newest-first; capped at 200 rows to bound
+  // payload size — operators with deeper history need pagination, defer
+  // until the row count actually gets that big.
+  app.get('/v1/admin/firmware', adminGuard, async (_req, reply) => {
+    const r = await app.db.query(
+      `select id, version, board, channel, url, signature, released_at
+         from firmware_versions
+        order by released_at desc
+        limit 200`,
+    );
+    return reply.send({ firmware: r.rows });
+  });
+
+  // =========================== Settings (non-secret env summary) =========
+  // GET /v1/admin/settings
+  //
+  // Return what the operator most often wants to verify after rolling a
+  // deploy: which optional integrations are configured, what CORS origins
+  // we're answering for, and the public web URL we use in transactional
+  // emails. NEVER return any secret value (keys, passwords, signing keys,
+  // smtp creds) — only booleans and non-secret strings.
+  app.get('/v1/admin/settings', adminGuard, async (_req, reply) => {
+    const corsOrigins = process.env.CORS_ORIGIN
+      ? process.env.CORS_ORIGIN.split(',').map((s) => s.trim()).filter(Boolean)
+      : [];
+    const emailProvider = process.env.EMAIL_PROVIDER ?? null;
+    return reply.send({
+      node_env:        process.env.NODE_ENV ?? 'development',
+      app_version:     process.env.APP_VERSION ?? 'dev',
+      public_web_url:  process.env.PUBLIC_WEB_URL ?? null,
+      public_api_url:  process.env.PUBLIC_API_URL ?? null,
+      cors_origins:    corsOrigins,
+      // Boolean "is configured" flags only — never the underlying secrets.
+      stripe_configured: !!process.env.STRIPE_SECRET_KEY,
+      stripe_price_amount_cents:
+        process.env.STRIPE_PRICE_AMOUNT_CENTS
+          ? Number(process.env.STRIPE_PRICE_AMOUNT_CENTS)
+          : null,
+      email: {
+        provider:        emailProvider,
+        from:            process.env.EMAIL_FROM ?? null,
+        smtp_configured: emailProvider === 'smtp'  && !!process.env.SMTP_HOST,
+        graph_configured:emailProvider === 'graph' && !!process.env.GRAPH_TENANT_ID,
+      },
+      oauth: {
+        apple_configured:  !!process.env.APPLE_CLIENT_ID,
+        google_configured: !!(process.env.GOOGLE_CLIENT_ID_IOS
+                              || process.env.GOOGLE_CLIENT_ID_ANDROID
+                              || process.env.GOOGLE_CLIENT_ID_WEB),
+        google_audiences: [
+          process.env.GOOGLE_CLIENT_ID_IOS     ? 'ios'     : null,
+          process.env.GOOGLE_CLIENT_ID_ANDROID ? 'android' : null,
+          process.env.GOOGLE_CLIENT_ID_WEB     ? 'web'     : null,
+        ].filter(Boolean),
+      },
+      mqtt: {
+        public_host: process.env.MQTT_PUBLIC_HOST ?? null,
+        public_port: Number(process.env.MQTT_PUBLIC_PORT ?? 8883),
+      },
+      ota: {
+        signing_key_configured: !!process.env.OTA_SIGNING_KEY_PATH,
+      },
+    });
+  });
 }
