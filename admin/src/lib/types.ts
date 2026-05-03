@@ -112,32 +112,45 @@ export interface FirmwareListResponse {
   firmware: FirmwareRow[];
 }
 
-export interface AdminSettings {
-  node_env: string;
-  app_version: string;
-  public_web_url: string | null;
-  public_api_url: string | null;
-  cors_origins: string[];
-  stripe_configured: boolean;
-  stripe_price_amount_cents: number | null;
-  email: {
-    provider: string | null;
-    from: string | null;
-    smtp_configured: boolean;
-    graph_configured: boolean;
-  };
-  oauth: {
-    apple_configured: boolean;
-    google_configured: boolean;
-    google_audiences: string[];
-  };
-  mqtt: {
-    public_host: string | null;
-    public_port: number;
-  };
-  ota: {
-    signing_key_configured: boolean;
-  };
+/**
+ * Runtime settings response shape.
+ *
+ * Mirrors api/src/lib/settings.ts SettingView. Each entry is one row in
+ * the registry; for secret keys the `value` field is omitted and the UI
+ * relies on `is_secret_set` to decide whether to render a "configured"
+ * placeholder.
+ */
+export type SettingGroup =
+  | 'public'
+  | 'branding'
+  | 'email'
+  | 'oauth'
+  | 'stripe'
+  | 'behavior'
+  | 'security';
+
+export type SettingType = 'string' | 'number' | 'boolean' | 'enum' | 'text' | 'csv';
+
+export interface SettingView {
+  key: string;
+  group: SettingGroup;
+  label: string;
+  hint: string | null;
+  type: SettingType;
+  enum_values: string[] | null;
+  is_secret: boolean;
+  is_secret_set: boolean;
+  /** Present (and possibly null) for non-secret settings; omitted for secrets. */
+  value?: unknown;
+  has_db_override: boolean;
+  needs_restart: boolean;
+  updated_at: string | null;
+  updated_by_email: string | null;
+}
+
+export interface AdminSettingsResponse {
+  settings: SettingView[];
+  needs_restart: boolean;
 }
 
 export interface StripeProduct {
