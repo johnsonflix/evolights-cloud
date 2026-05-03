@@ -29,14 +29,39 @@ export async function registerRelayRoutes(app: FastifyInstance) {
   app.mqtt.subscribe('evolights/+/state', (err) => {
     if (err) app.log.error({ err: err.message }, 'mqtt subscribe failed');
   });
+  // Topic format we expect: `evolights/<deviceId>/state`
+  const TOPIC_RE = /^evolights\/([^/]+)\/state$/;
   app.mqtt.on('message', (topic, payload) => {
-    if (!topic.endsWith('/state')) return;
+    const m = TOPIC_RE.exec(topic);
+    if (!m) return;
+    const topicDeviceId = m[1];
+
     let msg: any;
     try { msg = JSON.parse(payload.toString()); } catch { return; }
     const id = msg?.id;
     if (typeof id !== 'string') return;
+
     const p = pending.get(id);
     if (!p) return;
+
+    // Cross-tenant leak guard. The pending map is keyed only on `id` (a
+    // random per-request token) and a compromised device can publish on
+    // its own /state topic with ANY id it wants -- including an id it
+    // observed/guessed for another in-flight relay against a different
+    // device. Without this check, the malicious device's payload would
+    // be returned as the response to that other request, leaking state
+    // (or worse, planting fake state) across tenants.
+    //
+    // Only accept the reply if the publishing device's id matches the
+    // device the request was sent to.
+    if (topicDeviceId !== p.deviceId) {
+      app.log.warn(
+        { topicDeviceId, expectedDeviceId: p.deviceId, id },
+        'dropping cross-device relay reply',
+      );
+      return;
+    }
+
     pending.delete(id);
     clearTimeout(p.timer);
     p.resolve(msg);
