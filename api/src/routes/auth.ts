@@ -48,7 +48,9 @@ export async function registerAuthRoutes(app: FastifyInstance) {
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_payload', details: parsed.error.flatten() });
     const { email, password } = parsed.data;
 
-    const exists = await app.db.query('select 1 from users where email = $1', [email]);
+    const exists = await app.db.query(
+      'select 1 from users where email = $1 and deleted_at is null', [email],
+    );
     if (exists.rowCount) return reply.code(409).send({ error: 'email_in_use' });
 
     const hash = await argon2.hash(password, { type: argon2.argon2id });
@@ -73,7 +75,7 @@ export async function registerAuthRoutes(app: FastifyInstance) {
     const { email, password } = parsed.data;
 
     const r = await app.db.query(
-      'select id, email, password_hash from users where email = $1',
+      'select id, email, password_hash from users where email = $1 and deleted_at is null',
       [email],
     );
     if (!r.rowCount || !r.rows[0].password_hash) {
@@ -101,7 +103,7 @@ export async function registerAuthRoutes(app: FastifyInstance) {
               s.status as sub_status, s.current_period_end
          from users u
          left join subscriptions s on s.user_id = u.id
-        where u.id = $1`,
+        where u.id = $1 and u.deleted_at is null`,
       [req.user.sub],
     );
     if (!r.rowCount) return reply.code(404).send({ error: 'not_found' });
@@ -114,7 +116,10 @@ export async function registerAuthRoutes(app: FastifyInstance) {
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_payload' });
 
-    const r = await app.db.query('select password_hash from users where id = $1', [req.user.sub]);
+    const r = await app.db.query(
+      'select password_hash from users where id = $1 and deleted_at is null',
+      [req.user.sub],
+    );
     if (!r.rowCount) return reply.code(404).send({ error: 'not_found' });
     if (!r.rows[0].password_hash) {
       // OAuth-only user trying to change a non-existent password. They should
@@ -168,7 +173,7 @@ export async function registerAuthRoutes(app: FastifyInstance) {
 
     // Look up the account but always return 202 so we don't leak existence.
     const r = await app.db.query<{ id: string; email: string }>(
-      'select id, email from users where email = $1',
+      'select id, email from users where email = $1 and deleted_at is null',
       [parsed.data.email],
     );
 
@@ -377,7 +382,7 @@ async function findOrLinkOrCreateUser(
 
   // 1. Lookup by sub.
   const bySub = await app.db.query<{ id: string; email: string }>(
-    `select id, email from users where ${subCol} = $1`,
+    `select id, email from users where ${subCol} = $1 and deleted_at is null`,
     [args.sub],
   );
   if (bySub.rowCount) return bySub.rows[0];
@@ -386,7 +391,7 @@ async function findOrLinkOrCreateUser(
   if (args.email) {
     const byEmail = await app.db.query<{ id: string; email: string; existing_sub: string | null }>(
       `select id, email, ${subCol} as existing_sub
-         from users where email = $1`,
+         from users where email = $1 and deleted_at is null`,
       [args.email],
     );
     if (byEmail.rowCount) {

@@ -34,10 +34,11 @@ export async function registerJwt(app: FastifyInstance) {
       return reply.code(401).send({ error: 'unauthorized' });
     }
     const r = await app.db.query<{ tokens_valid_after: Date }>(
-      'select tokens_valid_after from users where id = $1', [sub],
+      'select tokens_valid_after from users where id = $1 and deleted_at is null',
+      [sub],
     );
     if (!r.rowCount) {
-      // user deleted while their token was still valid
+      // user (hard- OR soft-) deleted while their token was still valid
       return reply.code(401).send({ error: 'unauthorized' });
     }
     if (iat * 1000 < r.rows[0].tokens_valid_after.getTime()) {

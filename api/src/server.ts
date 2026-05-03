@@ -10,6 +10,7 @@ import { registerBillingRoutes } from './routes/billing.js';
 import { registerDeviceRoutes } from './routes/devices.js';
 import { registerRelayRoutes }  from './routes/relay.js';
 import { registerOtaRoutes }    from './routes/ota.js';
+import { registerAdminRoutes }  from './routes/admin.js';
 
 import { connectDb }     from './db/client.js';
 import { runMigrations } from './db/migrate.js';
@@ -115,6 +116,7 @@ await registerBillingRoutes(app);
 await registerDeviceRoutes(app);
 await registerRelayRoutes(app);
 await registerOtaRoutes(app);
+await registerAdminRoutes(app);
 
 try {
   await app.listen({ port, host: '0.0.0.0' });
