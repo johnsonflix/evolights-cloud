@@ -7,7 +7,15 @@ const credSchema = z.object({
   password: z.string().min(8).max(128),
 });
 
+// Computed once at module load — argon2.hash with default params takes ~100ms,
+// so we MUST NOT do it per request. Used to equalise timing on the
+// "user does not exist" branch of /v1/auth/login so an attacker can't enumerate
+// registered emails by measuring response latency.
+const DUMMY_HASH_PROMISE: Promise<string> = argon2.hash('dummy-for-timing-equalization', { type: argon2.argon2id });
+
 export async function registerAuthRoutes(app: FastifyInstance) {
+  const DUMMY_HASH = await DUMMY_HASH_PROMISE;
+
   // POST /v1/auth/register
   app.post('/v1/auth/register', async (req, reply) => {
     const parsed = credSchema.safeParse(req.body);
@@ -34,7 +42,13 @@ export async function registerAuthRoutes(app: FastifyInstance) {
     const { email, password } = parsed.data;
 
     const r = await app.db.query('select id, email, password_hash from users where email = $1', [email]);
-    if (!r.rowCount) return reply.code(401).send({ error: 'invalid_credentials' });
+    if (!r.rowCount) {
+      // Burn time on a constant-time-ish argon2 verify so attackers can't
+      // enumerate registered emails by latency. Result is intentionally
+      // discarded; we always fail this branch.
+      await argon2.verify(DUMMY_HASH, password).catch(() => false);
+      return reply.code(401).send({ error: 'invalid_credentials' });
+    }
     const user = r.rows[0];
     const ok = await argon2.verify(user.password_hash, password);
     if (!ok) return reply.code(401).send({ error: 'invalid_credentials' });
