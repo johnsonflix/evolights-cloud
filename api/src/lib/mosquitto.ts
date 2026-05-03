@@ -12,8 +12,11 @@ const exec = promisify(execFile);
  * This is the simplest way to wire dynamic per-device credentials into a
  * stock eclipse-mosquitto:2 image without bringing in a custom auth plugin.
  * Trade-off: edits are file-based and not transactional — if two pairings
- * race, one's write may overwrite the other's. We hold a Postgres advisory
- * lock around the operation to serialize.
+ * race, one's write may overwrite the other's. The CALLER is responsible
+ * for serialising; in routes/devices.ts we hold a Postgres advisory xact
+ * lock (`pg_advisory_xact_lock(hashtext('mosquitto-provision'))`) around
+ * addMqttUser+appendDeviceAcl+reloadMosquitto so concurrent API replicas
+ * don't clobber each other's edits.
  */
 
 const MOSQ_DIR = process.env.MOSQUITTO_DIR ?? '/mosquitto-config';
@@ -53,10 +56,46 @@ topic read  evolights/${deviceId}/ota
 }
 
 export async function removeDeviceAcl(username: string): Promise<void> {
+  // Line-based parser. The previous regex approach had three problems:
+  //   1. The username was interpolated unescaped into the pattern, so any
+  //      regex metacharacter in the (DB-generated, but still: defence in
+  //      depth) username would corrupt the match.
+  //   2. The leading `\n` lookahead made the FIRST user block in the file
+  //      unmatchable.
+  //   3. fs.writeFile is not atomic; a crash mid-write left a truncated
+  //      ACL file that mosquitto would then refuse to parse, taking the
+  //      broker down on the next reload.
+  //
+  // Fix: walk the file by lines, drop the block starting at the matching
+  // "user <name>" line and continuing until the next "user " or EOF, then
+  // write the result to a sibling temp file and rename() over the target.
+  // rename() is atomic on POSIX (and on Windows for same-volume targets),
+  // so a crash leaves either the old or the new file fully intact.
   const acl = await fs.readFile(ACL, 'utf8').catch(() => '');
-  // Remove the block from "user <name>" up to (not including) the next blank line / next user.
-  const re = new RegExp(`\\nuser ${username}\\n(?:.*\\n)*?(?=\\nuser |$)`, 'g');
-  await fs.writeFile(ACL, acl.replace(re, ''), 'utf8');
+  if (!acl) return;
+
+  const target = `user ${username}`;
+  const lines = acl.split('\n');
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trim() === target) {
+      // Skip this block: this line and every following non-`user ` line.
+      i++;
+      while (i < lines.length && !lines[i].trimStart().startsWith('user ')) {
+        i++;
+      }
+      // Don't advance past a `user ...` line — it starts the next block.
+      continue;
+    }
+    out.push(line);
+    i++;
+  }
+
+  const tmp = ACL + '.tmp';
+  await fs.writeFile(tmp, out.join('\n'), 'utf8');
+  await fs.rename(tmp, ACL);
 }
 
 export async function reloadMosquitto(): Promise<void> {
