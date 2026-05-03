@@ -62,7 +62,10 @@ export async function registerBillingRoutes(app: FastifyInstance) {
   // req.body. The previous code did `req.rawBody ?? req.body` and also installed
   // a no-op preParsing hook; both removed.
   app.post('/v1/billing/webhook', {
-    config: { rawBody: true },
+    // rateLimit:false disables the global 100/min cap. Stripe is a trusted
+    // source and month-end subscription event bursts must never be dropped --
+    // a dropped event leaves our DB out of sync with Stripe's truth.
+    config: { rawBody: true, rateLimit: false },
   }, async (req: any, reply) => {
     if (!app.stripe) return reply.code(503).send({ error: 'billing_disabled' });
     const signature = req.headers['stripe-signature'];

@@ -74,7 +74,12 @@ export async function registerDeviceRoutes(app: FastifyInstance) {
   // round-trip) and a stranded broker user has no ACL match for any device
   // topic, so it cannot do anything until garbage-collected. Full atomicity
   // would require a custom mosquitto auth plugin reading directly from PG.
-  app.post('/v1/devices/redeem', async (req, reply) => {
+  app.post('/v1/devices/redeem', {
+    // Pairing codes are 6 chars from a ~30-character alphabet (~30^6 = 7.3e8
+    // keyspace). Per-IP cap of 10/min keeps online guessing infeasible while
+    // still allowing legitimate retry on flaky device wifi.
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+  }, async (req, reply) => {
     const schema = z.object({
       code:       z.string().length(6),
       fw_version: z.string().min(1).max(32),

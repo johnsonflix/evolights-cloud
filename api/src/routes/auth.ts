@@ -17,7 +17,11 @@ export async function registerAuthRoutes(app: FastifyInstance) {
   const DUMMY_HASH = await DUMMY_HASH_PROMISE;
 
   // POST /v1/auth/register
-  app.post('/v1/auth/register', async (req, reply) => {
+  // Tight rate limit per-IP to slow account-creation abuse / address enumeration
+  // via the 409 email_in_use signal.
+  app.post('/v1/auth/register', {
+    config: { rateLimit: { max: 5, timeWindow: '1 hour' } },
+  }, async (req, reply) => {
     const parsed = credSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_payload', details: parsed.error.flatten() });
     const { email, password } = parsed.data;
@@ -36,7 +40,12 @@ export async function registerAuthRoutes(app: FastifyInstance) {
   });
 
   // POST /v1/auth/login
-  app.post('/v1/auth/login', async (req, reply) => {
+  // Tight rate limit per-IP — primary defence against credential stuffing /
+  // online password brute force. argon2 already makes each guess expensive
+  // (~100ms CPU); this caps the number of guesses to a per-IP-per-window quota.
+  app.post('/v1/auth/login', {
+    config: { rateLimit: { max: 5, timeWindow: '15 minutes' } },
+  }, async (req, reply) => {
     const parsed = credSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_payload' });
     const { email, password } = parsed.data;
