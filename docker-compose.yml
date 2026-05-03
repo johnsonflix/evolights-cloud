@@ -54,6 +54,25 @@ services:
     ports:
       - "8080:8080"
 
+  # Admin web UI. Server-side rendered Next.js app that proxies the
+  # /v1/admin/* endpoints behind a cookie session. Talks to the api over
+  # the internal docker network (API_BASE_URL=http://api:8080).
+  admin:
+    build:
+      context: ./admin
+      dockerfile: Dockerfile
+    image: ghcr.io/johnsonflix/evolights-cloud-admin:local
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      API_BASE_URL: http://api:8080
+      NEXT_PUBLIC_BRAND: EvoLights
+      NODE_ENV: ${NODE_ENV}
+    ports:
+      - "3000:3000"
+
 volumes:
   postgres-data:
   mosquitto-data:
