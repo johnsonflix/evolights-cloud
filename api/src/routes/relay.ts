@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import crypto from 'node:crypto';
+import { getSetting } from '../lib/settings.js';
 
 /**
  * Cloud command relay.
@@ -23,7 +24,9 @@ interface PendingReq {
 const pending = new Map<string, PendingReq>();
 
 export async function registerRelayRoutes(app: FastifyInstance) {
-  const ackTimeoutMs = Number(process.env.RELAY_ACK_TIMEOUT_MS ?? 5000);
+  // ackTimeoutMs is now resolved per-request from runtime settings (was
+  // RELAY_ACK_TIMEOUT_MS env at boot). Lets the operator tune the relay
+  // wait window from the admin UI without a restart.
 
   // Subscribe once to all device state topics; the device id is in the path.
   app.mqtt.subscribe('evolights/+/state', (err) => {
@@ -93,6 +96,7 @@ export async function registerRelayRoutes(app: FastifyInstance) {
     const id = crypto.randomBytes(8).toString('hex');
     const cmd = { id, ...parsed.data };
 
+    const ackTimeoutMs = (await getSetting<number>(app.db, 'behavior.relay_timeout_ms')) ?? 5000;
     const responsePromise = new Promise<any>((resolve, rejectInner) => {
       const timer = setTimeout(() => {
         pending.delete(id);

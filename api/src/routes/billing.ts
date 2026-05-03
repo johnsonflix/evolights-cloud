@@ -1,8 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import type Stripe from 'stripe';
+import { getSetting } from '../lib/settings.js';
 
 export async function registerBillingRoutes(app: FastifyInstance) {
-  const priceId = process.env.STRIPE_PRICE_ID_MONTHLY;
+  // STRIPE_PRICE_ID_MONTHLY is now a runtime setting; resolved per-checkout
+  // so an operator can switch the default plan from the admin UI without
+  // restart. STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET deliberately stay
+  // env-only -- rotating those mid-flight would brick in-flight checkouts
+  // and the webhook signature, and they're set once at deploy time.
 
   // Helper: get-or-create the Stripe customer for a user, persisted in subscriptions table.
   async function ensureCustomer(userId: string, email: string): Promise<string> {
@@ -22,7 +27,8 @@ export async function registerBillingRoutes(app: FastifyInstance) {
   // POST /v1/billing/checkout — returns a Stripe Checkout Session URL for the user to subscribe.
   app.post('/v1/billing/checkout', { preHandler: app.requireUser }, async (req: any, reply) => {
     if (!app.stripe) return reply.code(503).send({ error: 'billing_disabled' });
-    if (!priceId) return reply.code(500).send({ error: 'STRIPE_PRICE_ID_MONTHLY not configured' });
+    const priceId = await getSetting<string>(app.db, 'stripe.price_id_monthly');
+    if (!priceId) return reply.code(500).send({ error: 'stripe.price_id_monthly not configured' });
 
     const customerId = await ensureCustomer(req.user.sub, req.user.email);
     const session = await app.stripe.checkout.sessions.create({
