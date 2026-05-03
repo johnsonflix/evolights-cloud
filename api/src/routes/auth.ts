@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import argon2 from 'argon2';
 import { z } from 'zod';
+import crypto from 'node:crypto';
 
 const credSchema = z.object({
   email:    z.string().email().max(255),
@@ -110,6 +111,108 @@ export async function registerAuthRoutes(app: FastifyInstance) {
       'update users set tokens_valid_after=now(), updated_at=now() where id=$1',
       [req.user.sub],
     );
+    return reply.send({ ok: true });
+  });
+
+  // ----------------- Password reset flow ---------------------------------
+  // Two-step:
+  //   POST /v1/auth/forgot-password  body {email}    -> 202 always
+  //   POST /v1/auth/reset-password   body {token,password} -> 200 / 410
+  // Always-202 on forgot-password prevents account enumeration. The body
+  // validation errors still 400 because they don't leak account existence.
+
+  const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL ?? 'https://app.evolights.io';
+  const RESET_TTL_MIN = 30;
+
+  app.post('/v1/auth/forgot-password', {
+    // Tight per-IP cap: forgot-password is a free email-bomb amplifier
+    // (attacker submits a victim's address; we send them a reset email).
+    // 5/hr per IP keeps abuse low while letting a real user retry on typos.
+    config: { rateLimit: { max: 5, timeWindow: '1 hour' } },
+  }, async (req, reply) => {
+    const schema = z.object({ email: z.string().email().max(255) });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_payload' });
+
+    // Look up the account but always return 202 so we don't leak existence.
+    const r = await app.db.query<{ id: string; email: string }>(
+      'select id, email from users where email = $1',
+      [parsed.data.email],
+    );
+
+    if (r.rowCount && app.email) {
+      const userId = r.rows[0].id;
+      const token = crypto.randomBytes(16).toString('hex'); // 32 hex chars
+      try {
+        await app.db.query(
+          `insert into password_reset_tokens (token, user_id, expires_at)
+           values ($1, $2, now() + ($3 || ' minutes')::interval)`,
+          [token, userId, RESET_TTL_MIN],
+        );
+        const resetUrl = `${PUBLIC_WEB_URL.replace(/\/+$/, '')}/reset?token=${token}`;
+        await app.email.send({
+          to: r.rows[0].email,
+          subject: 'Reset your EvoLights password',
+          text:
+            `Someone (hopefully you) requested a password reset for your EvoLights account.\n\n` +
+            `Open this link to set a new password (valid for ${RESET_TTL_MIN} minutes):\n${resetUrl}\n\n` +
+            `If you didn't request this, you can ignore this email — your password will not change.`,
+          html:
+            `<p>Someone (hopefully you) requested a password reset for your EvoLights account.</p>` +
+            `<p><a href="${resetUrl}">Click here to set a new password</a> (valid for ${RESET_TTL_MIN} minutes).</p>` +
+            `<p>If you didn't request this, you can ignore this email — your password will not change.</p>`,
+        });
+      } catch (e: any) {
+        // Don't leak send failures to the client; the always-202 contract
+        // hides whether email even fired. Log it loudly so an operator
+        // notices smtp/Graph drift.
+        app.log.error({ err: e.message, userId }, 'forgot-password send failed');
+      }
+    } else if (r.rowCount && !app.email) {
+      // Account exists but we have no email service — log so the operator
+      // sees that resets are silently dead. Still 202 to user.
+      app.log.warn({ email: parsed.data.email }, 'forgot-password requested but no email service configured');
+    }
+
+    return reply.code(202).send({ ok: true });
+  });
+
+  app.post('/v1/auth/reset-password', {
+    config: { rateLimit: { max: 10, timeWindow: '1 hour' } },
+  }, async (req, reply) => {
+    const schema = z.object({
+      token:    z.string().regex(/^[0-9a-f]{32}$/),
+      password: z.string().min(8).max(128),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_payload' });
+
+    // Atomic claim: the conditional UPDATE either wins (returning user_id) or
+    // returns no rows (already used / expired / unknown). No SELECT-then-UPDATE
+    // race window. Same pattern as pairing-code redemption in devices.ts.
+    const claim = await app.db.query<{ user_id: string }>(
+      `update password_reset_tokens
+          set used_at = now()
+        where token = $1
+          and used_at is null
+          and expires_at > now()
+        returning user_id`,
+      [parsed.data.token],
+    );
+    if (!claim.rowCount) return reply.code(410).send({ error: 'token_invalid_or_expired' });
+
+    const newHash = await argon2.hash(parsed.data.password, { type: argon2.argon2id });
+    // Bump tokens_valid_after so any sessions established before the reset
+    // are revoked — if an attacker had a stolen token, it stops working now.
+    await app.db.query(
+      `update users
+          set password_hash = $1,
+              tokens_valid_after = now(),
+              updated_at = now()
+        where id = $2`,
+      [newHash, claim.rows[0].user_id],
+    );
+
     return reply.send({ ok: true });
   });
 }
