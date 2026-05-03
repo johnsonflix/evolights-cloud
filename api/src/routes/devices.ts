@@ -4,6 +4,7 @@ import argon2 from 'argon2';
 import crypto from 'node:crypto';
 import { addMqttUser, appendDeviceAcl, generateMqttPassword, reloadMosquitto, removeDeviceAcl, removeMqttUser } from '../lib/mosquitto.js';
 import { hasActiveSub } from '../lib/stripe.js';
+import { getSetting } from '../lib/settings.js';
 
 /** 6-character base32 (Crockford) — readable, no I/O/0/1 confusion. */
 function generatePairingCode(): string {
@@ -15,16 +16,17 @@ function generatePairingCode(): string {
 }
 
 export async function registerDeviceRoutes(app: FastifyInstance) {
-  const codeTtl = Number(process.env.PAIRING_CODE_TTL_SECONDS ?? 300);
-  const brokerHost = process.env.MQTT_PUBLIC_HOST ?? 'mqtt.evolights.io';
-  const brokerPort = Number(process.env.MQTT_PUBLIC_PORT ?? 8883);
-  // The full root CA chain that the device must trust — pasted into wsec.json.
-  // Loaded from a file at startup.
-  let caCertPem = '';
-  if (process.env.MQTT_CA_PEM_PATH) {
-    try { caCertPem = require('node:fs').readFileSync(process.env.MQTT_CA_PEM_PATH, 'utf8'); }
-    catch (e) { app.log.warn({ err: (e as Error).message }, 'could not read MQTT_CA_PEM_PATH'); }
-  }
+  // All previously-env values (PAIRING_CODE_TTL_SECONDS, MQTT_PUBLIC_HOST,
+  // MQTT_PUBLIC_PORT, MQTT_CA_PEM_PATH, PUBLIC_API_URL) are now resolved
+  // per-request from runtime settings via getSetting(). The 60s in-process
+  // cache keeps this overhead negligible (one Map lookup per call). The
+  // legacy env vars are still honoured as first-boot defaults via the
+  // settings registry's envKey fall-through.
+  //
+  // Affects-future-pairings caveat: existing paired devices keep whatever
+  // broker host/port/CA they cached during their original /v1/devices/redeem.
+  // Changing mqtt.* in the admin UI does NOT silently re-key in-the-field
+  // hardware; the admin UI surfaces this caveat.
 
   // ------------------- App-side: issue a pairing code --------------------
   // POST /v1/pairing/codes  (auth: user; subscription: required)
@@ -33,6 +35,10 @@ export async function registerDeviceRoutes(app: FastifyInstance) {
     if (!sub.rowCount || !hasActiveSub(sub.rows[0].status)) {
       return reply.code(402).send({ error: 'subscription_required' });
     }
+
+    // Pull TTL + public API URL from settings each request (cached).
+    const codeTtl   = (await getSetting<number>(app.db, 'behavior.pairing_code_ttl_seconds')) ?? 300;
+    const publicApi = (await getSetting<string>(app.db, 'api.public_url')) ?? 'https://api.evolights.io';
 
     // One-shot, expiring. Persist hashed for at-rest defense.
     const code = generatePairingCode();
@@ -45,7 +51,7 @@ export async function registerDeviceRoutes(app: FastifyInstance) {
     return reply.send({
       code,
       expires_in: codeTtl,
-      cloud_api: process.env.PUBLIC_API_URL ?? `https://api.evolights.io`,
+      cloud_api: publicApi,
     });
   });
 
@@ -197,6 +203,13 @@ export async function registerDeviceRoutes(app: FastifyInstance) {
       }
 
       await client.query('commit');
+
+      // Resolve broker connection bits from current settings. Fetched
+      // post-commit so we don't hold the broker file lock across the
+      // (potentially network-bound) settings cache miss.
+      const brokerHost = (await getSetting<string>(app.db, 'mqtt.public_host')) ?? 'mqtt.evolights.io';
+      const brokerPort = (await getSetting<number>(app.db, 'mqtt.public_port')) ?? 8883;
+      const caCertPem  = (await getSetting<string>(app.db, 'mqtt.ca_cert_pem')) ?? '';
 
       return reply.send({
         device_id:   deviceId,

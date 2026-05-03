@@ -1,6 +1,15 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import Stripe from 'stripe';
+import {
+  SETTINGS,
+  clearSetting,
+  getSetting,
+  invalidateSettingsCache,
+  listSettings,
+  setSetting,
+  validateSettingValue,
+} from '../lib/settings.js';
 
 /**
  * Master admin endpoints. EVERY route here is gated by both requireUser
@@ -66,7 +75,9 @@ export async function registerAdminRoutes(app: FastifyInstance) {
           where used_at is not null and used_at > now() - interval '24 hours'`,
       ),
     ]);
-    const priceCents = Number(process.env.STRIPE_PRICE_AMOUNT_CENTS ?? 0);
+    // priceCents is sourced from runtime settings (was STRIPE_PRICE_AMOUNT_CENTS).
+    // null/0 means "no estimate available" -- the admin UI renders an em-dash.
+    const priceCents = (await getSetting<number>(app.db, 'stripe.price_amount_cents')) ?? 0;
     const mrrCents = priceCents > 0 ? Number(mrr.rows[0].c) * priceCents : null;
     return reply.send({
       users_count:          Number(users.rows[0].c),
@@ -433,55 +444,166 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     return reply.send({ firmware: r.rows });
   });
 
-  // =========================== Settings (non-secret env summary) =========
-  // GET /v1/admin/settings
+  // =========================== Runtime settings CRUD =====================
   //
-  // Return what the operator most often wants to verify after rolling a
-  // deploy: which optional integrations are configured, what CORS origins
-  // we're answering for, and the public web URL we use in transactional
-  // emails. NEVER return any secret value (keys, passwords, signing keys,
-  // smtp creds) — only booleans and non-secret strings.
+  // GET /v1/admin/settings  -> the typed registry plus current values, with
+  //   secret fields redacted (only is_secret_set is exposed). Also returns
+  //   `needs_restart: true` if any registered setting is currently flagged
+  //   as restart-required AND has a DB override (operator changed it but
+  //   the live process hasn't picked it up yet -- e.g. CORS origins).
+  //
+  // PATCH /v1/admin/settings  body { updates: [{key, value}] }
+  //   - Validates every key against SETTINGS registry; unknown key -> 400.
+  //   - Validates each value against the setting's declared type.
+  //   - For secret fields: empty string ("") is treated as "leave unchanged"
+  //     (the UI sends "" by default so we don't ask the operator to retype
+  //     a secret on every save). null clears the override; any other value
+  //     overwrites.
+  //   - Side effects after a successful write:
+  //       * email.* changes -> app.invalidateEmail() so the next send
+  //         rebuilds the transporter from fresh creds.
+  //       * security.cors_origins flagged needsRestart -- the CORS plugin
+  //         is bound at registration time and can't be hot-swapped, so we
+  //         persist + log + surface a banner via needs_restart in the
+  //         response.
+  //   - Returns the updated settings list (same shape as GET).
+  //
+  // Secrets never appear in any response body. Mutations to secret keys
+  // are still logged at info level (without the value) so an operator can
+  // confirm a rotation went through.
+
   app.get('/v1/admin/settings', adminGuard, async (_req, reply) => {
-    const corsOrigins = process.env.CORS_ORIGIN
-      ? process.env.CORS_ORIGIN.split(',').map((s) => s.trim()).filter(Boolean)
-      : [];
-    const emailProvider = process.env.EMAIL_PROVIDER ?? null;
+    const settings = await listSettings(app.db);
+    // needs_restart heuristic: any restart-required setting that has a
+    // pending DB override (i.e. the operator HAS set it via the UI). On
+    // first boot with only env defaults, has_db_override=false and no
+    // banner appears even though the registry contains restart-required
+    // entries.
+    const needsRestart = settings.some((s) => s.needs_restart && s.has_db_override);
+    return reply.send({ settings, needs_restart: needsRestart });
+  });
+
+  app.patch('/v1/admin/settings', adminGuard, async (req: any, reply) => {
+    const schema = z.object({
+      updates: z.array(z.object({
+        key:   z.string().min(1).max(128),
+        // value is jsonb-shaped; we re-validate via the registry's per-type
+        // checker below, so accept any JSON value here.
+        value: z.unknown(),
+      })).min(1).max(64),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_payload' });
+
+    const userId: string = req.user.sub;
+
+    // Pre-validate every update before we touch the DB so a single bad
+    // entry rejects the whole batch (admin UI sends the whole tab on
+    // save; partial application would leave the form out of sync with
+    // server state).
+    const planned: Array<
+      | { kind: 'set'; key: string; value: unknown; needsRestart: boolean; isSecret: boolean; group: string }
+      | { kind: 'clear'; key: string; needsRestart: boolean; isSecret: boolean; group: string }
+      | { kind: 'skip'; key: string }
+    > = [];
+
+    for (const upd of parsed.data.updates) {
+      const def = SETTINGS.find((s) => s.key === upd.key);
+      if (!def) {
+        return reply.code(400).send({ error: 'unknown_setting', key: upd.key });
+      }
+      // Secret-field "leave unchanged" sentinel: empty string. We treat
+      // explicit null as the unambiguous "clear" signal (UI sends null
+      // when the operator clicks a "Reset to env default" affordance).
+      if (def.isSecret && upd.value === '') {
+        planned.push({ kind: 'skip', key: upd.key });
+        continue;
+      }
+      if (upd.value === null) {
+        planned.push({
+          kind: 'clear',
+          key: upd.key,
+          needsRestart: !!def.needsRestart,
+          isSecret: !!def.isSecret,
+          group: def.group,
+        });
+        continue;
+      }
+      const validated = validateSettingValue(def, upd.value);
+      if (!validated.ok) {
+        return reply.code(400).send({
+          error: 'invalid_setting_value',
+          key: upd.key,
+          detail: validated.error,
+        });
+      }
+      planned.push({
+        kind: 'set',
+        key: upd.key,
+        value: validated.value,
+        needsRestart: !!def.needsRestart,
+        isSecret: !!def.isSecret,
+        group: def.group,
+      });
+    }
+
+    // Apply each update. Each insert/delete is its own statement -- we
+    // deliberately don't wrap in a transaction because (a) app_settings is
+    // a single-row-per-key table (no cross-row consistency to preserve)
+    // and (b) we want partial success on a freak DB hiccup mid-batch
+    // rather than throwing away the whole save.
+    const touchedGroups = new Set<string>();
+    let anyRestartRequired = false;
+    let appliedCount = 0;
+    for (const p of planned) {
+      if (p.kind === 'skip') continue;
+      try {
+        if (p.kind === 'clear') {
+          await clearSetting(app.db, p.key);
+        } else {
+          await setSetting(app.db, p.key, p.value, userId);
+        }
+        appliedCount++;
+        touchedGroups.add(p.group);
+        if (p.needsRestart) anyRestartRequired = true;
+        // Don't log the value of secret keys; the key + actor is enough
+        // for an audit trail.
+        app.log.info(
+          {
+            key: p.key,
+            actor: userId,
+            kind: p.kind,
+            ...(p.isSecret ? {} : { value: p.kind === 'set' ? p.value : null }),
+          },
+          'app_setting updated',
+        );
+      } catch (e: any) {
+        app.log.error({ err: e.message, key: p.key }, 'app_setting write failed');
+        return reply.code(500).send({ error: 'write_failed', key: p.key });
+      }
+    }
+
+    // Side effects on settings groups that have hot-reload hooks.
+    if (touchedGroups.has('email')) {
+      app.invalidateEmail();
+    }
+    // Belt-and-braces: clear the WHOLE in-process cache on any successful
+    // write. setSetting/clearSetting already invalidated per-key, but other
+    // resolvers may have cached related computed values; cheap to redo.
+    invalidateSettingsCache();
+
+    if (anyRestartRequired) {
+      app.log.warn(
+        { groups: [...touchedGroups] },
+        'one or more settings require a container restart to take effect',
+      );
+    }
+
+    const updated = await listSettings(app.db);
     return reply.send({
-      node_env:        process.env.NODE_ENV ?? 'development',
-      app_version:     process.env.APP_VERSION ?? 'dev',
-      public_web_url:  process.env.PUBLIC_WEB_URL ?? null,
-      public_api_url:  process.env.PUBLIC_API_URL ?? null,
-      cors_origins:    corsOrigins,
-      // Boolean "is configured" flags only — never the underlying secrets.
-      stripe_configured: !!process.env.STRIPE_SECRET_KEY,
-      stripe_price_amount_cents:
-        process.env.STRIPE_PRICE_AMOUNT_CENTS
-          ? Number(process.env.STRIPE_PRICE_AMOUNT_CENTS)
-          : null,
-      email: {
-        provider:        emailProvider,
-        from:            process.env.EMAIL_FROM ?? null,
-        smtp_configured: emailProvider === 'smtp'  && !!process.env.SMTP_HOST,
-        graph_configured:emailProvider === 'graph' && !!process.env.GRAPH_TENANT_ID,
-      },
-      oauth: {
-        apple_configured:  !!process.env.APPLE_CLIENT_ID,
-        google_configured: !!(process.env.GOOGLE_CLIENT_ID_IOS
-                              || process.env.GOOGLE_CLIENT_ID_ANDROID
-                              || process.env.GOOGLE_CLIENT_ID_WEB),
-        google_audiences: [
-          process.env.GOOGLE_CLIENT_ID_IOS     ? 'ios'     : null,
-          process.env.GOOGLE_CLIENT_ID_ANDROID ? 'android' : null,
-          process.env.GOOGLE_CLIENT_ID_WEB     ? 'web'     : null,
-        ].filter(Boolean),
-      },
-      mqtt: {
-        public_host: process.env.MQTT_PUBLIC_HOST ?? null,
-        public_port: Number(process.env.MQTT_PUBLIC_PORT ?? 8883),
-      },
-      ota: {
-        signing_key_configured: !!process.env.OTA_SIGNING_KEY_PATH,
-      },
+      settings: updated,
+      needs_restart: updated.some((s) => s.needs_restart && s.has_db_override),
+      applied: appliedCount,
     });
   });
 }

@@ -4,6 +4,7 @@ import { z } from 'zod';
 import crypto from 'node:crypto';
 import { OAuth2Client } from 'google-auth-library';
 import appleSignin, { type AppleIdTokenType } from 'apple-signin-auth';
+import { getSetting } from '../lib/settings.js';
 
 const credSchema = z.object({
   email:    z.string().email().max(255),
@@ -16,27 +17,29 @@ const credSchema = z.object({
 // registered emails by measuring response latency.
 const DUMMY_HASH_PROMISE: Promise<string> = argon2.hash('dummy-for-timing-equalization', { type: argon2.argon2id });
 
-/** Build the per-process Google verifier configured for ALL allowed audiences. */
-function loadGoogleAudiences(): string[] {
-  return [
-    process.env.GOOGLE_CLIENT_ID_IOS,
-    process.env.GOOGLE_CLIENT_ID_ANDROID,
-    process.env.GOOGLE_CLIENT_ID_WEB,
-  ].filter((s): s is string => !!s && s.length > 0);
+/**
+ * Build the list of accepted Google audiences from current settings.
+ *
+ * Called at request time rather than boot so admin UI changes to
+ * oauth.google.* take effect without restarting the API. The settings
+ * module's 60s cache keeps this cheap (one Map lookup per call).
+ */
+async function loadGoogleAudiences(app: FastifyInstance): Promise<string[]> {
+  return (
+    await Promise.all([
+      getSetting<string>(app.db, 'oauth.google.ios_client_id'),
+      getSetting<string>(app.db, 'oauth.google.android_client_id'),
+      getSetting<string>(app.db, 'oauth.google.web_client_id'),
+    ])
+  ).filter((s): s is string => !!s && s.length > 0);
 }
 
 export async function registerAuthRoutes(app: FastifyInstance) {
   const DUMMY_HASH = await DUMMY_HASH_PROMISE;
 
-  const googleAudiences = loadGoogleAudiences();
-  const googleClient = googleAudiences.length ? new OAuth2Client() : null;
-  if (!googleAudiences.length) {
-    app.log.warn('no GOOGLE_CLIENT_ID_* configured — POST /v1/auth/google will 503');
-  }
-  const appleClientId = process.env.APPLE_CLIENT_ID;
-  if (!appleClientId) {
-    app.log.warn('APPLE_CLIENT_ID not set — POST /v1/auth/apple will 503');
-  }
+  // The OAuth2Client is stateless w.r.t. audience (we pass it per call), so
+  // we can cache one shared instance forever.
+  const googleClient = new OAuth2Client();
 
   // POST /v1/auth/register
   // Tight rate limit per-IP to slow account-creation abuse / address enumeration
@@ -158,7 +161,6 @@ export async function registerAuthRoutes(app: FastifyInstance) {
   // Always-202 on forgot-password prevents account enumeration. The body
   // validation errors still 400 because they don't leak account existence.
 
-  const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL ?? 'https://app.evolights.io';
   const RESET_TTL_MIN = 30;
 
   app.post('/v1/auth/forgot-password', {
@@ -177,7 +179,11 @@ export async function registerAuthRoutes(app: FastifyInstance) {
       [parsed.data.email],
     );
 
-    if (r.rowCount && app.email) {
+    // Email service + branding values are resolved per-request from runtime
+    // settings so an admin can rotate SMTP creds, change provider, or update
+    // the brand name in the admin UI without bouncing the api.
+    const emailService = await app.email();
+    if (r.rowCount && emailService) {
       const userId = r.rows[0].id;
       const token = crypto.randomBytes(16).toString('hex'); // 32 hex chars
       try {
@@ -186,16 +192,20 @@ export async function registerAuthRoutes(app: FastifyInstance) {
            values ($1, $2, now() + ($3 || ' minutes')::interval)`,
           [token, userId, RESET_TTL_MIN],
         );
-        const resetUrl = `${PUBLIC_WEB_URL.replace(/\/+$/, '')}/reset?token=${token}`;
-        await app.email.send({
+        const publicWebUrl =
+          (await getSetting<string>(app.db, 'web.public_url')) ?? 'https://app.evolights.io';
+        const brandName =
+          (await getSetting<string>(app.db, 'brand.name')) ?? 'EvoLights';
+        const resetUrl = `${publicWebUrl.replace(/\/+$/, '')}/reset?token=${token}`;
+        await emailService.send({
           to: r.rows[0].email,
-          subject: 'Reset your EvoLights password',
+          subject: `Reset your ${brandName} password`,
           text:
-            `Someone (hopefully you) requested a password reset for your EvoLights account.\n\n` +
+            `Someone (hopefully you) requested a password reset for your ${brandName} account.\n\n` +
             `Open this link to set a new password (valid for ${RESET_TTL_MIN} minutes):\n${resetUrl}\n\n` +
             `If you didn't request this, you can ignore this email — your password will not change.`,
           html:
-            `<p>Someone (hopefully you) requested a password reset for your EvoLights account.</p>` +
+            `<p>Someone (hopefully you) requested a password reset for your ${brandName} account.</p>` +
             `<p><a href="${resetUrl}">Click here to set a new password</a> (valid for ${RESET_TTL_MIN} minutes).</p>` +
             `<p>If you didn't request this, you can ignore this email — your password will not change.</p>`,
         });
@@ -205,7 +215,7 @@ export async function registerAuthRoutes(app: FastifyInstance) {
         // notices smtp/Graph drift.
         app.log.error({ err: e.message, userId }, 'forgot-password send failed');
       }
-    } else if (r.rowCount && !app.email) {
+    } else if (r.rowCount && !emailService) {
       // Account exists but we have no email service — log so the operator
       // sees that resets are silently dead. Still 202 to user.
       app.log.warn({ email: parsed.data.email }, 'forgot-password requested but no email service configured');
@@ -266,6 +276,9 @@ export async function registerAuthRoutes(app: FastifyInstance) {
   app.post('/v1/auth/apple', {
     config: { rateLimit: { max: 30, timeWindow: '15 minutes' } },
   }, async (req, reply) => {
+    // Resolved per-request from settings so admins can rotate the Apple
+    // Services ID via /v1/admin/settings without bouncing the api.
+    const appleClientId = await getSetting<string>(app.db, 'oauth.apple.client_id');
     if (!appleClientId) return reply.code(503).send({ error: 'apple_not_configured' });
     const schema = z.object({
       id_token: z.string().min(10).max(8192),
@@ -315,7 +328,10 @@ export async function registerAuthRoutes(app: FastifyInstance) {
   app.post('/v1/auth/google', {
     config: { rateLimit: { max: 30, timeWindow: '15 minutes' } },
   }, async (req, reply) => {
-    if (!googleClient || googleAudiences.length === 0) {
+    // Resolved per-request so an operator can add/remove client IDs from the
+    // admin UI without restarting the api.
+    const googleAudiences = await loadGoogleAudiences(app);
+    if (googleAudiences.length === 0) {
       return reply.code(503).send({ error: 'google_not_configured' });
     }
     const schema = z.object({
