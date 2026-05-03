@@ -46,11 +46,26 @@ export async function registerOtaRoutes(app: FastifyInstance) {
   try { await loadSigningKey(); app.log.info('ota signing key loaded'); }
   catch (e: any) { app.log.warn({ err: e.message }, 'ota signing key not loaded; OTA endpoints will return 503'); }
 
-  // POST /v1/ota/firmwares  (admin only — TODO add admin role; for now rely on
-  //                          deployment access controls)
+  // POST /v1/ota/firmwares  (admin only)
+  //
   // Body: { version, board, channel, url, sha256 }
   // Stores a signed manifest; later, /v1/ota/check fetches the latest matching channel.
-  app.post('/v1/ota/firmwares', async (req, reply) => {
+  //
+  // Auth model: standard user JWT + users.is_admin must be true. An operator
+  // bootstraps admin access by manually flipping the column on a user row in
+  // the DB. This is intentionally minimal (no self-promote endpoint).
+  //
+  // TODO: split signing from registration. Today, possession of an admin JWT
+  // is sufficient to publish a firmware row that the cloud will then sign with
+  // the OTA private key — so a single compromised admin password lets an
+  // attacker push malware to every paired device. The fix is to require an
+  // OFFLINE Ed25519 signature on `version|url|sha256` in the request body
+  // (signed on a hardware token / HSM offline by a release engineer); this
+  // endpoint then verifies that signature against a registered release-engineer
+  // public key BEFORE countersigning for distribution. That defends against
+  // compromised admin credentials by making the cloud-side key only a
+  // distribution co-signer rather than the primary trust root.
+  app.post('/v1/ota/firmwares', { preHandler: [app.requireUser, app.requireAdmin] }, async (req, reply) => {
     if (!signingKey) return reply.code(503).send({ error: 'signing_unavailable' });
     const schema = z.object({
       version: z.string().min(1).max(32),
