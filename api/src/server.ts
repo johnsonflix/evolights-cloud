@@ -9,6 +9,7 @@ import { registerRelayRoutes }  from './routes/relay.js';
 import { registerOtaRoutes }    from './routes/ota.js';
 
 import { connectDb }     from './db/client.js';
+import { runMigrations } from './db/migrate.js';
 import { connectMqtt }   from './mqtt/client.js';
 import { registerJwt }   from './lib/jwt.js';
 import { registerStripe } from './lib/stripe.js';
@@ -32,6 +33,11 @@ await app.register(fastifyRawBody, {
 });
 
 await connectDb(app);
+// Apply pending SQL migrations BEFORE we accept any traffic. The legacy
+// schema.sql bootstrap (mounted into postgres-entrypoint-initdb.d) only ever
+// fires on a brand-new postgres data volume; subsequent schema changes must
+// flow through src/db/migrations/.
+await runMigrations(app.db, app.log);
 await connectMqtt(app);
 await registerJwt(app);
 await registerStripe(app);
