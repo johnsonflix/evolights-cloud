@@ -94,7 +94,10 @@ export async function registerBillingRoutes(app: FastifyInstance) {
 
     const upsert = async (sub: Stripe.Subscription) => {
       const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer.id;
-      const periodEnd  = sub.items.data[0]?.current_period_end ?? null;
+      // Stripe SDK v17+ types: current_period_end lives on Subscription itself,
+      // not on SubscriptionItem. Earlier code path silently null'd in newer SDKs
+      // because items.data[0].current_period_end isn't a known property.
+      const periodEnd = sub.current_period_end ?? null;
       await app.db.query(
         `update subscriptions
             set stripe_sub_id = $1,
