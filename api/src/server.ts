@@ -16,6 +16,7 @@ import { runMigrations } from './db/migrate.js';
 import { connectMqtt }   from './mqtt/client.js';
 import { registerJwt }   from './lib/jwt.js';
 import { registerStripe } from './lib/stripe.js';
+import { loadEmailService, type EmailService } from './lib/email.js';
 
 const port = Number(process.env.PORT ?? 8080);
 
@@ -100,6 +101,13 @@ await runMigrations(app.db, app.log);
 await connectMqtt(app);
 await registerJwt(app);
 await registerStripe(app);
+
+// Email service: optional. loadEmailService logs a warning + returns null if
+// no provider is configured; routes that need email (e.g. forgot-password)
+// will 503 in that case. Decorating with `null` keeps app.email truthy-
+// checkable from any route handler.
+const email: EmailService | null = await loadEmailService(app.log);
+app.decorate('email', email);
 
 await registerHealthRoutes(app);
 await registerAuthRoutes(app);
