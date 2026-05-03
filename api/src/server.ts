@@ -17,7 +17,8 @@ import { runMigrations } from './db/migrate.js';
 import { connectMqtt }   from './mqtt/client.js';
 import { registerJwt }   from './lib/jwt.js';
 import { registerStripe } from './lib/stripe.js';
-import { loadEmailService, type EmailService } from './lib/email.js';
+import { registerEmailService } from './lib/email.js';
+import { getSetting } from './lib/settings.js';
 
 const port = Number(process.env.PORT ?? 8080);
 
@@ -63,15 +64,27 @@ await app.register(fastifyRawBody, {
 // helmet config is appropriate for a JSON API that is not serving a browser UI.
 await app.register(fastifyHelmet);
 
-// CORS: deny by default. Operator opts in via CORS_ORIGIN (comma-separated
-// allowlist of origins). The webhook + relay endpoints intentionally do not
-// require CORS since they are called by Stripe (server-side) and native mobile
-// clients (no Origin header) respectively, and a missing-Origin request is
-// already accepted by @fastify/cors when origin is a function returning false
-// for unspecified origins.
-const corsOrigins = process.env.CORS_ORIGIN
-  ? process.env.CORS_ORIGIN.split(',').map((s) => s.trim()).filter(Boolean)
-  : false;
+// DB has to come up BEFORE CORS so the CORS plugin can read its allowlist
+// from the runtime settings table (which was previously a CORS_ORIGIN env
+// var). Migrations run inside connectDb's wake so app_settings exists by
+// the time we read from it below.
+await connectDb(app);
+await runMigrations(app.db, app.log);
+
+// CORS: deny by default. Allowlist source-of-truth is the runtime
+// `security.cors_origins` setting (DB override beats env). The webhook
+// and relay endpoints intentionally do not require CORS since they are
+// called by Stripe (server-side) and native mobile clients (no Origin
+// header) respectively, and a missing-Origin request is already accepted
+// by @fastify/cors when origin is a function returning false for
+// unspecified origins.
+//
+// Restart-required caveat: @fastify/cors binds the origin policy at
+// register-time, so changes to security.cors_origins won't take effect
+// until the next boot. The admin UI surfaces this with a needs_restart
+// banner; see app_settings.needs_restart in routes/admin.ts.
+const dbCorsOrigins = await getSetting<string[]>(app.db, 'security.cors_origins');
+const corsOrigins = dbCorsOrigins && dbCorsOrigins.length > 0 ? dbCorsOrigins : false;
 await app.register(fastifyCors, {
   // origin === false denies cross-origin browser requests; same-origin and
   // requests with no Origin header (Stripe webhook callers, native mobile
@@ -93,22 +106,17 @@ await app.register(fastifyRateLimit, {
   // be dropped, or our DB falls out of sync with Stripe.
 });
 
-await connectDb(app);
-// Apply pending SQL migrations BEFORE we accept any traffic. The legacy
-// schema.sql bootstrap (mounted into postgres-entrypoint-initdb.d) only ever
-// fires on a brand-new postgres data volume; subsequent schema changes must
-// flow through src/db/migrations/.
-await runMigrations(app.db, app.log);
 await connectMqtt(app);
 await registerJwt(app);
 await registerStripe(app);
 
-// Email service: optional. loadEmailService logs a warning + returns null if
-// no provider is configured; routes that need email (e.g. forgot-password)
-// will 503 in that case. Decorating with `null` keeps app.email truthy-
-// checkable from any route handler.
-const email: EmailService | null = await loadEmailService(app.log);
-app.decorate('email', email);
+// Email service: optional and now runtime-mutable. registerEmailService
+// decorates app with a resolver function (`app.email()`) that lazily builds
+// + memoises a transporter from current settings. The admin PATCH endpoint
+// calls app.invalidateEmail() when any email.* setting changes so credential
+// rotation takes effect on the next /v1/auth/forgot-password without a
+// process restart. Routes still receive null when no provider is configured.
+await registerEmailService(app);
 
 await registerHealthRoutes(app);
 await registerAuthRoutes(app);
