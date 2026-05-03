@@ -19,7 +19,17 @@ export async function registerStripe(app: FastifyInstance) {
   app.log.info('stripe configured');
 }
 
-export const SUB_STATUSES_ACTIVE = new Set(['active', 'trialing']);
+// Statuses that grant product access. We deliberately INCLUDE 'past_due':
+// Stripe enters past_due during the 1-3 day card retry window after a
+// renewal failure, and cutting service mid-window is a poor customer
+// experience for what is usually an expired card -- the customer hasn't
+// chosen to cancel. We cut access at:
+//   - 'unpaid'              (Stripe gave up on retries)
+//   - 'canceled'            (subscription ended)
+//   - 'incomplete'          (initial payment never succeeded)
+//   - 'incomplete_expired'  (initial payment window elapsed)
+// Note: 'paused' (rare) is also denial; not in the active set.
+export const SUB_STATUSES_ACTIVE = new Set(['active', 'trialing', 'past_due']);
 
 export function hasActiveSub(status: string | null | undefined): boolean {
   return !!status && SUB_STATUSES_ACTIVE.has(status);
