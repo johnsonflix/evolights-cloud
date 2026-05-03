@@ -69,7 +69,24 @@ export async function registerAuthRoutes(app: FastifyInstance) {
       return reply.code(401).send({ error: 'invalid_credentials' });
     }
     const hash = await argon2.hash(parsed.data.next, { type: argon2.argon2id });
-    await app.db.query('update users set password_hash=$1, updated_at=now() where id=$2', [hash, req.user.sub]);
+    // Bumping tokens_valid_after invalidates EVERY token issued before now,
+    // including the one currently in this request. The client must log in
+    // again with the new password to receive a fresh token.
+    await app.db.query(
+      'update users set password_hash=$1, tokens_valid_after=now(), updated_at=now() where id=$2',
+      [hash, req.user.sub],
+    );
+    return reply.send({ ok: true });
+  });
+
+  // POST /v1/auth/logout-everywhere — invalidate every token for this user.
+  // Useful after a suspected credential leak. Same revocation mechanism as
+  // change-password (bumps users.tokens_valid_after to now()).
+  app.post('/v1/auth/logout-everywhere', { preHandler: app.requireUser }, async (req: any, reply) => {
+    await app.db.query(
+      'update users set tokens_valid_after=now(), updated_at=now() where id=$1',
+      [req.user.sub],
+    );
     return reply.send({ ok: true });
   });
 }
