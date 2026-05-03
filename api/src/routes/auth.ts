@@ -2,6 +2,8 @@ import type { FastifyInstance } from 'fastify';
 import argon2 from 'argon2';
 import { z } from 'zod';
 import crypto from 'node:crypto';
+import { OAuth2Client } from 'google-auth-library';
+import appleSignin, { type AppleIdTokenType } from 'apple-signin-auth';
 
 const credSchema = z.object({
   email:    z.string().email().max(255),
@@ -14,8 +16,27 @@ const credSchema = z.object({
 // registered emails by measuring response latency.
 const DUMMY_HASH_PROMISE: Promise<string> = argon2.hash('dummy-for-timing-equalization', { type: argon2.argon2id });
 
+/** Build the per-process Google verifier configured for ALL allowed audiences. */
+function loadGoogleAudiences(): string[] {
+  return [
+    process.env.GOOGLE_CLIENT_ID_IOS,
+    process.env.GOOGLE_CLIENT_ID_ANDROID,
+    process.env.GOOGLE_CLIENT_ID_WEB,
+  ].filter((s): s is string => !!s && s.length > 0);
+}
+
 export async function registerAuthRoutes(app: FastifyInstance) {
   const DUMMY_HASH = await DUMMY_HASH_PROMISE;
+
+  const googleAudiences = loadGoogleAudiences();
+  const googleClient = googleAudiences.length ? new OAuth2Client() : null;
+  if (!googleAudiences.length) {
+    app.log.warn('no GOOGLE_CLIENT_ID_* configured — POST /v1/auth/google will 503');
+  }
+  const appleClientId = process.env.APPLE_CLIENT_ID;
+  if (!appleClientId) {
+    app.log.warn('APPLE_CLIENT_ID not set — POST /v1/auth/apple will 503');
+  }
 
   // POST /v1/auth/register
   // Tight rate limit per-IP to slow account-creation abuse / address enumeration
@@ -51,11 +72,17 @@ export async function registerAuthRoutes(app: FastifyInstance) {
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_payload' });
     const { email, password } = parsed.data;
 
-    const r = await app.db.query('select id, email, password_hash from users where email = $1', [email]);
-    if (!r.rowCount) {
+    const r = await app.db.query(
+      'select id, email, password_hash from users where email = $1',
+      [email],
+    );
+    if (!r.rowCount || !r.rows[0].password_hash) {
       // Burn time on a constant-time-ish argon2 verify so attackers can't
       // enumerate registered emails by latency. Result is intentionally
       // discarded; we always fail this branch.
+      // The `!password_hash` branch hits OAuth-only users (signed up via
+      // Apple/Google, no local password set yet) and gives them the same
+      // response so we don't reveal which providers are linked.
       await argon2.verify(DUMMY_HASH, password).catch(() => false);
       return reply.code(401).send({ error: 'invalid_credentials' });
     }
@@ -70,7 +97,7 @@ export async function registerAuthRoutes(app: FastifyInstance) {
   // GET /v1/me — returns the logged-in user + their subscription state
   app.get('/v1/me', { preHandler: app.requireUser }, async (req: any, reply) => {
     const r = await app.db.query(
-      `select u.id, u.email, u.created_at,
+      `select u.id, u.email, u.created_at, u.email_verified,
               s.status as sub_status, s.current_period_end
          from users u
          left join subscriptions s on s.user_id = u.id
@@ -89,6 +116,11 @@ export async function registerAuthRoutes(app: FastifyInstance) {
 
     const r = await app.db.query('select password_hash from users where id = $1', [req.user.sub]);
     if (!r.rowCount) return reply.code(404).send({ error: 'not_found' });
+    if (!r.rows[0].password_hash) {
+      // OAuth-only user trying to change a non-existent password. They should
+      // use a future "set password" flow instead.
+      return reply.code(409).send({ error: 'no_local_password' });
+    }
     if (!(await argon2.verify(r.rows[0].password_hash, parsed.data.current))) {
       return reply.code(401).send({ error: 'invalid_credentials' });
     }
@@ -215,4 +247,178 @@ export async function registerAuthRoutes(app: FastifyInstance) {
 
     return reply.send({ ok: true });
   });
+
+  // ----------------- Sign in with Apple --------------------------------
+  // POST /v1/auth/apple body { id_token, nonce? }
+  //
+  // Native flow: the iOS app uses ASAuthorizationAppleIDProvider to obtain an
+  // ID token signed by Apple, then POSTs that token here. We verify against
+  // Apple's JWKS (https://appleid.apple.com/auth/keys), confirm aud == our
+  // services ID, then look up / link / create the user.
+  //
+  // apple-signin-auth handles JWKS rotation correctly (Apple has rotated keys
+  // multiple times); rolling JWKS verification ourselves would be brittle.
+  app.post('/v1/auth/apple', {
+    config: { rateLimit: { max: 30, timeWindow: '15 minutes' } },
+  }, async (req, reply) => {
+    if (!appleClientId) return reply.code(503).send({ error: 'apple_not_configured' });
+    const schema = z.object({
+      id_token: z.string().min(10).max(8192),
+      nonce:    z.string().min(1).max(128).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_payload' });
+
+    let claims: AppleIdTokenType;
+    try {
+      claims = await appleSignin.verifyIdToken(parsed.data.id_token, {
+        audience: appleClientId,
+        nonce:    parsed.data.nonce,
+        // ignoreExpiration is intentionally NOT set (default false) — token
+        // exp is enforced.
+      });
+    } catch (e: any) {
+      app.log.warn({ err: e.message }, 'apple id_token verification failed');
+      return reply.code(401).send({ error: 'invalid_id_token' });
+    }
+
+    const sub = claims.sub;
+    const email = claims.email?.toLowerCase();
+    // Apple's email_verified is delivered as a string ("true") or boolean
+    // depending on flow; coerce.
+    const verified = String(claims.email_verified ?? 'false') === 'true';
+
+    const user = await findOrLinkOrCreateUser(app, {
+      provider: 'apple',
+      sub,
+      email,
+      emailVerified: verified,
+    });
+    if (!user) return reply.code(409).send({ error: 'account_link_conflict' });
+
+    const token = app.jwt.sign({ sub: user.id, email: user.email });
+    return reply.send({ token, user: { id: user.id, email: user.email } });
+  });
+
+  // ----------------- Sign in with Google -------------------------------
+  // POST /v1/auth/google body { id_token }
+  //
+  // Native flow: iOS / Android / web app uses Google's SDK to obtain an ID
+  // token; we verify it against Google's JWKS via google-auth-library and
+  // accept tokens issued for any of our configured client IDs (different per
+  // platform).
+  app.post('/v1/auth/google', {
+    config: { rateLimit: { max: 30, timeWindow: '15 minutes' } },
+  }, async (req, reply) => {
+    if (!googleClient || googleAudiences.length === 0) {
+      return reply.code(503).send({ error: 'google_not_configured' });
+    }
+    const schema = z.object({
+      id_token: z.string().min(10).max(8192),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_payload' });
+
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken: parsed.data.id_token,
+        // Passing an array makes verifyIdToken accept tokens whose aud claim
+        // matches any of our configured client IDs (iOS / Android / web).
+        audience: googleAudiences,
+      });
+      payload = ticket.getPayload();
+    } catch (e: any) {
+      app.log.warn({ err: e.message }, 'google id_token verification failed');
+      return reply.code(401).send({ error: 'invalid_id_token' });
+    }
+    if (!payload || !payload.sub) return reply.code(401).send({ error: 'invalid_id_token' });
+
+    const sub = payload.sub;
+    const email = payload.email?.toLowerCase();
+    const verified = !!payload.email_verified;
+
+    const user = await findOrLinkOrCreateUser(app, {
+      provider: 'google',
+      sub,
+      email,
+      emailVerified: verified,
+    });
+    if (!user) return reply.code(409).send({ error: 'account_link_conflict' });
+
+    const token = app.jwt.sign({ sub: user.id, email: user.email });
+    return reply.send({ token, user: { id: user.id, email: user.email } });
+  });
+}
+
+/**
+ * Look up / link / create a user given an OAuth-provider sub + optional email.
+ *
+ * Order of precedence:
+ *   1. Match by provider sub (apple_sub / google_sub) → existing user
+ *   2. Match by email → link this provider sub to that account, mark verified
+ *      if provider asserts it
+ *   3. Create new user, no password_hash, set provider sub
+ *
+ * Returns null on the rare case where the email is bound to an account that
+ * already has a DIFFERENT provider sub (extremely unlikely; signals an
+ * account mishap an admin needs to resolve manually).
+ */
+async function findOrLinkOrCreateUser(
+  app: FastifyInstance,
+  args: {
+    provider: 'apple' | 'google';
+    sub: string;
+    email: string | undefined;
+    emailVerified: boolean;
+  },
+): Promise<{ id: string; email: string } | null> {
+  const subCol = args.provider === 'apple' ? 'apple_sub' : 'google_sub';
+
+  // 1. Lookup by sub.
+  const bySub = await app.db.query<{ id: string; email: string }>(
+    `select id, email from users where ${subCol} = $1`,
+    [args.sub],
+  );
+  if (bySub.rowCount) return bySub.rows[0];
+
+  // 2. Lookup by email — link if found.
+  if (args.email) {
+    const byEmail = await app.db.query<{ id: string; email: string; existing_sub: string | null }>(
+      `select id, email, ${subCol} as existing_sub
+         from users where email = $1`,
+      [args.email],
+    );
+    if (byEmail.rowCount) {
+      const row = byEmail.rows[0];
+      if (row.existing_sub && row.existing_sub !== args.sub) {
+        // Email is bound to a different provider sub — refuse rather than
+        // silently re-link. An admin (or a future "merge accounts" flow)
+        // needs to resolve this.
+        return null;
+      }
+      await app.db.query(
+        `update users
+            set ${subCol} = $1,
+                email_verified = email_verified or $2,
+                updated_at = now()
+          where id = $3`,
+        [args.sub, args.emailVerified, row.id],
+      );
+      return { id: row.id, email: row.email };
+    }
+  }
+
+  // 3. Create. Apple may not give us an email at all (private relay drops
+  // after first login); store a synthetic placeholder so the unique
+  // constraint on email is satisfied. Operators can later prompt the user
+  // to add a real email through a profile-update endpoint.
+  const email = args.email ?? `${args.sub}@${args.provider}.users.noreply.evolights.io`;
+  const ins = await app.db.query<{ id: string; email: string }>(
+    `insert into users (email, password_hash, ${subCol}, email_verified)
+     values ($1, null, $2, $3)
+     returning id, email`,
+    [email, args.sub, args.emailVerified],
+  );
+  return ins.rows[0];
 }
