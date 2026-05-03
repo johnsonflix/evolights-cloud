@@ -49,20 +49,35 @@ export async function registerBillingRoutes(app: FastifyInstance) {
   });
 
   // POST /v1/billing/webhook — Stripe -> us. Validates signature, updates subscription state.
-  // Note: registers a custom raw body parser scoped to this route only; everything else
-  // continues to use Fastify's default JSON parser.
+  //
+  // fastify-raw-body (registered globally in server.ts with global:false) attaches
+  // req.rawBody when this route opts in via config.rawBody=true. Stripe signature
+  // verification REQUIRES the original byte-exact request body: Stripe HMACs the
+  // exact bytes Stripe sent us, so any reserialisation of the parsed JSON would
+  // produce a different byte sequence (whitespace, key order, number formatting)
+  // and fail signature verification -- or, worse with some libraries, validate
+  // unpredictably.
+  //
+  // Therefore we fail closed if rawBody is missing rather than falling back to
+  // req.body. The previous code did `req.rawBody ?? req.body` and also installed
+  // a no-op preParsing hook; both removed.
   app.post('/v1/billing/webhook', {
     config: { rawBody: true },
-    preParsing: async (req, _reply, payload) => payload,   // keep raw stream
-  } as any, async (req: any, reply) => {
+  }, async (req: any, reply) => {
     if (!app.stripe) return reply.code(503).send({ error: 'billing_disabled' });
     const signature = req.headers['stripe-signature'];
     const secret = process.env.STRIPE_WEBHOOK_SECRET;
     if (!signature || !secret) return reply.code(400).send({ error: 'missing_signature_or_secret' });
 
+    if (!req.rawBody) {
+      // Hard fail: never feed parsed JSON to constructEvent. See comment above.
+      app.log.error('stripe webhook received with no rawBody — refusing to verify against parsed body');
+      return reply.code(400).send({ error: 'missing_raw_body' });
+    }
+
     let event: Stripe.Event;
     try {
-      event = app.stripe.webhooks.constructEvent(req.rawBody ?? req.body, signature, secret);
+      event = app.stripe.webhooks.constructEvent(req.rawBody, signature, secret);
     } catch (e: any) {
       app.log.warn({ err: e.message }, 'stripe webhook signature failed');
       return reply.code(400).send({ error: 'bad_signature' });
